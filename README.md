@@ -1,3 +1,6 @@
+>[!NOTE]
+>This is a fork of <https://github.com/DavidBalishyan/C-Chat>
+
 [Watch the demo here](https://mega.nz/file/G3gRyCbb#mziMURUhjOgjdmDOo4gTBonqxGnJWyfNRoD_-6CAF-0)
 
 # How to run the app locally?
