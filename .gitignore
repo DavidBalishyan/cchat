@@ -36,7 +36,6 @@
 *.x86_64
 *.hex
 **/main
-**/server
 **/*.out
 
 # Debug files
