@@ -1,0 +1,584 @@
+#!/usr/bin/env python3
+# Copyright (c) 2026 David Balishyan
+# SPDX-License-Identifier: MIT
+"""Makeover: a small build system designed to be vendored with a project."""
+
+from __future__ import print_function
+
+import os
+import re
+import subprocess
+import sys
+
+
+BUILDFILE_NAME = "Buildfile"
+BUILDFILE_NORMAL_FORM = "buildfile"
+VARIABLE_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+VARIABLE_ASSIGNMENT = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)$")
+
+
+class BuildError(Exception):
+    """An error in a Buildfile or while executing a build."""
+
+    def __init__(self, message, line=None, source=None):
+        Exception.__init__(self, message)
+        self.message = message
+        self.line = line
+        self.source = source
+
+    def __str__(self):
+        if self.line is None:
+            return self.message
+        return "%s:%d: %s" % (self.source or BUILDFILE_NAME, self.line, self.message)
+
+
+def is_buildfile_name(filename):
+    """Return whether a filename is a case/separator variation of Buildfile."""
+    normalized = re.sub(r"[^A-Za-z0-9]", "", filename).lower()
+    return normalized == BUILDFILE_NORMAL_FORM
+
+
+def _matching_buildfile(directory):
+    try:
+        entries = os.listdir(directory)
+    except OSError:
+        return None
+
+    matches = []
+    for entry in entries:
+        path = os.path.join(directory, entry)
+        if is_buildfile_name(entry) and os.path.isfile(path):
+            matches.append(path)
+
+    if len(matches) > 1:
+        names = ", ".join(sorted(os.path.basename(path) for path in matches))
+        raise BuildError("multiple Buildfiles found in '%s': %s" % (directory, names))
+    return matches[0] if matches else None
+
+
+def _ancestor_directories(start):
+    directory = os.path.realpath(start)
+    while True:
+        yield directory
+        parent = os.path.dirname(directory)
+        if parent == directory:
+            break
+        directory = parent
+
+
+def discover_buildfile(current_directory=None, script_path=None):
+    """Find the nearest Buildfile from the working directory or script path."""
+    current_directory = os.getcwd() if current_directory is None else current_directory
+    script_path = __file__ if script_path is None else script_path
+    origins = [current_directory, os.path.dirname(os.path.realpath(script_path))]
+    searched = set()
+
+    for origin in origins:
+        for directory in _ancestor_directories(origin):
+            if directory in searched:
+                continue
+            searched.add(directory)
+            match = _matching_buildfile(directory)
+            if match is not None:
+                return os.path.abspath(match)
+
+    raise BuildError(
+        "no Buildfile found in the current directory, its parents, or the Makeover script's parents"
+    )
+
+
+class Recipe(object):
+    def __init__(self, command, line):
+        self.command = command
+        self.line = line
+
+
+class Target(object):
+    def __init__(self, name, prerequisites, recipes, doc, group, line):
+        self.name = name
+        self.prerequisites = prerequisites
+        self.recipes = recipes
+        self.doc = doc
+        self.group = group
+        self.line = line
+        self.phony = False
+
+
+class RawTarget(object):
+    def __init__(self, name, prerequisites, recipes, doc, group, line):
+        self.name = name
+        self.prerequisites = prerequisites
+        self.recipes = recipes
+        self.doc = doc
+        self.group = group
+        self.line = line
+
+
+class Buildfile(object):
+    """The parsed and validated representation of a Buildfile."""
+
+    def __init__(self, path=BUILDFILE_NAME, environment=None):
+        self.path = path
+        self.source_name = os.path.basename(path)
+        self.environment = dict(os.environ if environment is None else environment)
+        self.variables = {}
+        self.variable_lines = {}
+        self.targets = {}
+        self.target_order = []
+        self.first_target = None
+        self._raw_targets = []
+        self._raw_phony = []
+        self._variable_cache = {}
+
+    def _error(self, message, line=None):
+        return BuildError(message, line, self.source_name)
+
+    def parse(self):
+        if not os.path.isfile(self.path):
+            raise self._error("Buildfile '%s' not found" % self.path)
+
+        current_target = None
+        current_group = "General"
+        pending_doc = []
+
+        try:
+            source = open(self.path, "r")
+        except (IOError, OSError) as error:
+            raise self._error("cannot read Buildfile: %s" % error)
+
+        with source:
+            for line_number, source_line in enumerate(source, 1):
+                line = source_line.rstrip("\r\n")
+                stripped = line.strip()
+
+                if not stripped:
+                    pending_doc = []
+                    continue
+
+                if line[0].isspace():
+                    if current_target is None:
+                        raise self._error("recipe found outside a target", line_number)
+                    current_target.recipes.append(Recipe(line.lstrip(), line_number))
+                    continue
+
+                current_target = None
+
+                if stripped.startswith("#"):
+                    pending_doc.append(stripped[1:].strip())
+                    continue
+
+                if stripped.startswith("[group:") and stripped.endswith("]"):
+                    group_name = stripped[len("[group:"):-1].strip()
+                    if not group_name:
+                        raise self._error("group name cannot be empty", line_number)
+                    current_group = group_name
+                    pending_doc = []
+                    continue
+
+                if stripped.startswith("["):
+                    raise self._error("invalid group declaration", line_number)
+
+                assignment = VARIABLE_ASSIGNMENT.match(line)
+                if assignment is not None:
+                    name = assignment.group(1)
+                    self.variables[name] = assignment.group(2)
+                    self.variable_lines[name] = line_number
+                    self._variable_cache.pop(name, None)
+                    pending_doc = []
+                    continue
+
+                if stripped.startswith(".PHONY"):
+                    if not stripped.startswith(".PHONY:"):
+                        raise self._error("expected '.PHONY: target ...'", line_number)
+                    if stripped.count(":") != 1:
+                        raise self._error("invalid .PHONY declaration", line_number)
+                    names = stripped.split(":", 1)[1].strip()
+                    if not names:
+                        raise self._error(".PHONY requires at least one target", line_number)
+                    self._raw_phony.append((names, line_number))
+                    pending_doc = []
+                    continue
+
+                if line.count(":") != 1:
+                    raise self._error("expected a target declaration", line_number)
+
+                raw_name, raw_prerequisites = line.split(":", 1)
+                raw_name = raw_name.strip()
+                raw_prerequisites = raw_prerequisites.strip()
+                if not raw_name:
+                    raise self._error("target name cannot be empty", line_number)
+
+                raw_target = RawTarget(
+                    raw_name,
+                    raw_prerequisites,
+                    [],
+                    " ".join(pending_doc),
+                    current_group,
+                    line_number,
+                )
+                self._raw_targets.append(raw_target)
+                current_target = raw_target
+                pending_doc = []
+
+        self._finish_parsing()
+        return self
+
+    def _finish_parsing(self):
+        for raw_target in self._raw_targets:
+            name = self.expand(raw_target.name, raw_target.line)
+            self._validate_word(name, "target", raw_target.line)
+
+            expanded_prerequisites = self.expand(
+                raw_target.prerequisites, raw_target.line
+            )
+            prerequisites = expanded_prerequisites.split()
+            for prerequisite in prerequisites:
+                self._validate_word(prerequisite, "prerequisite", raw_target.line)
+
+            if name in self.targets:
+                raise self._error("duplicate target '%s'" % name, raw_target.line)
+
+            target = Target(
+                name,
+                prerequisites,
+                raw_target.recipes,
+                raw_target.doc,
+                raw_target.group,
+                raw_target.line,
+            )
+            self.targets[name] = target
+            self.target_order.append(name)
+            if self.first_target is None:
+                self.first_target = name
+
+        for raw_names, line_number in self._raw_phony:
+            expanded_names = self.expand(raw_names, line_number).split()
+            if not expanded_names:
+                raise self._error(".PHONY requires at least one target", line_number)
+            for name in expanded_names:
+                self._validate_word(name, "phony target", line_number)
+                if name not in self.targets:
+                    raise self._error(
+                        ".PHONY refers to undeclared target '%s'" % name,
+                        line_number,
+                    )
+                self.targets[name].phony = True
+
+    def _validate_word(self, value, kind, line):
+        if not value:
+            raise self._error("%s name cannot be empty" % kind, line)
+        if any(character.isspace() for character in value):
+            raise self._error(
+                "%s name cannot contain whitespace: '%s'" % (kind, value), line
+            )
+        if ":" in value or "=" in value:
+            raise self._error("invalid %s name '%s'" % (kind, value), line)
+
+    def expand(self, text, line=None, automatic=None, stack=None):
+        """Expand Makeover variables while leaving ordinary shell variables intact."""
+        if stack is None:
+            stack = []
+        result = []
+        index = 0
+
+        while index < len(text):
+            character = text[index]
+            if character != "$":
+                result.append(character)
+                index += 1
+                continue
+
+            if index + 1 >= len(text):
+                result.append("$")
+                index += 1
+                continue
+
+            marker = text[index + 1]
+            if marker == "$":
+                result.append("$")
+                index += 2
+                continue
+
+            if automatic is not None and marker in automatic:
+                result.append(automatic[marker])
+                index += 2
+                continue
+
+            if marker != "(":
+                result.append("$")
+                index += 1
+                continue
+
+            closing = text.find(")", index + 2)
+            if closing == -1:
+                raise self._error("unterminated variable reference", line)
+            name = text[index + 2:closing]
+            if not VARIABLE_NAME.match(name):
+                raise self._error("invalid variable reference '$(%s)'" % name, line)
+            result.append(self._resolve_variable(name, line, automatic, stack))
+            index = closing + 1
+
+        return "".join(result)
+
+    def _resolve_variable(self, name, line, automatic, stack):
+        if automatic is None and name in self._variable_cache:
+            return self._variable_cache[name]
+
+        if name in stack:
+            cycle = stack[stack.index(name):] + [name]
+            raise self._error("variable cycle detected: %s" % " -> ".join(cycle), line)
+
+        if name in self.variables:
+            value = self.expand(
+                self.variables[name],
+                self.variable_lines.get(name, line),
+                automatic,
+                stack + [name],
+            )
+        elif name in self.environment:
+            value = self.expand(
+                self.environment[name],
+                line,
+                automatic,
+                stack + [name],
+            )
+        else:
+            raise self._error("undefined variable '%s'" % name, line)
+
+        if automatic is None:
+            self._variable_cache[name] = value
+        return value
+
+
+class BuildSystem(object):
+    def __init__(self, buildfile, stdout=None, stderr=None, verbose=False):
+        self.buildfile = buildfile
+        self.stdout = sys.stdout if stdout is None else stdout
+        self.stderr = sys.stderr if stderr is None else stderr
+        self.verbose = verbose
+        self._completed = set()
+
+    def list_targets(self):
+        groups = []
+        grouped_targets = {}
+        for name in self.buildfile.target_order:
+            target = self.buildfile.targets[name]
+            if target.group not in grouped_targets:
+                groups.append(target.group)
+                grouped_targets[target.group] = []
+            grouped_targets[target.group].append(target)
+
+        print("Available targets:", file=self.stdout)
+        for group in groups:
+            print("\n%s:" % group, file=self.stdout)
+            targets = grouped_targets[group]
+            width = max(len(target.name) for target in targets)
+            for target in targets:
+                suffix = "  # %s" % target.doc if target.doc else ""
+                print("  %-*s%s" % (width, target.name, suffix), file=self.stdout)
+
+    def build(self, requested_targets):
+        for name in requested_targets:
+            self._validate_graph(name, [], set())
+        for name in requested_targets:
+            self._build_target(name)
+
+    def _validate_graph(self, name, path, validated):
+        if name in path:
+            cycle = path[path.index(name):] + [name]
+            line = self.buildfile.targets[name].line if name in self.buildfile.targets else None
+            raise BuildError(
+                "dependency cycle detected: %s" % " -> ".join(cycle),
+                line,
+                self.buildfile.source_name,
+            )
+        if name in validated:
+            return
+        if name not in self.buildfile.targets:
+            if not os.path.exists(name):
+                raise BuildError("no rule to make target '%s' and file not found" % name)
+            validated.add(name)
+            return
+
+        target = self.buildfile.targets[name]
+        for prerequisite in target.prerequisites:
+            self._validate_graph(prerequisite, path + [name], validated)
+        validated.add(name)
+
+    def _build_target(self, name):
+        if name in self._completed:
+            return
+        if name not in self.buildfile.targets:
+            self._completed.add(name)
+            return
+
+        target = self.buildfile.targets[name]
+        for prerequisite in target.prerequisites:
+            self._build_target(prerequisite)
+
+        if self._needs_rebuild(target):
+            self._run_recipes(target)
+        else:
+            self._log("Target '%s' is up to date." % target.name)
+        self._completed.add(name)
+
+    def _needs_rebuild(self, target):
+        if target.phony or not os.path.exists(target.name):
+            return True
+
+        target_mtime = os.path.getmtime(target.name)
+        for prerequisite_name in target.prerequisites:
+            prerequisite = self.buildfile.targets.get(prerequisite_name)
+            if prerequisite is not None and prerequisite.phony:
+                return True
+            if not os.path.exists(prerequisite_name):
+                return True
+            if os.path.getmtime(prerequisite_name) > target_mtime:
+                return True
+        return False
+
+    def _run_recipes(self, target):
+        self._log("Building target: %s" % target.name)
+        automatic = {
+            "@": target.name,
+            "<": target.prerequisites[0] if target.prerequisites else "",
+            "^": " ".join(target.prerequisites),
+        }
+        for recipe in target.recipes:
+            command, silent, ignore_failure = self._recipe_options(recipe.command)
+            command = self.buildfile.expand(command, recipe.line, automatic)
+            if not command:
+                continue
+            if not silent:
+                print(command, file=self.stdout)
+                self.stdout.flush()
+            return_code = subprocess.call(["/bin/sh", "-c", command])
+            if return_code != 0 and ignore_failure:
+                print(
+                    "makeover: warning: command failed with status %d (ignored): %s"
+                    % (return_code, command),
+                    file=self.stderr,
+                )
+            elif return_code != 0:
+                raise BuildError(
+                    "command failed with status %d: %s" % (return_code, command),
+                    recipe.line,
+                    self.buildfile.source_name,
+                )
+
+    @staticmethod
+    def _recipe_options(command):
+        silent = False
+        ignore_failure = False
+        index = 0
+        while index < len(command) and command[index] in "@-":
+            if command[index] == "@":
+                silent = True
+            else:
+                ignore_failure = True
+            index += 1
+        return command[index:].lstrip(), silent, ignore_failure
+
+    def _log(self, message):
+        if not self.verbose:
+            return
+        print("[Makeover] %s" % message, file=self.stdout)
+        self.stdout.flush()
+
+
+USAGE = """usage: makeover [options] [target ...]
+
+Build targets from the nearest Buildfile. The first target is used by default.
+
+options:
+  -f, --file PATH  use PATH as the Buildfile
+  -h, --help       show this help message
+  -l, --list       list documented targets without building
+  -v, --verbose    show Makeover build status messages
+"""
+
+
+def parse_arguments(arguments):
+    show_help = False
+    list_only = False
+    verbose = False
+    buildfile_path = None
+    targets = []
+    index = 0
+    while index < len(arguments):
+        argument = arguments[index]
+        if argument in ("-h", "--help"):
+            show_help = True
+        elif argument in ("-l", "--list"):
+            list_only = True
+        elif argument in ("-v", "--verbose"):
+            verbose = True
+        elif argument in ("-f", "--file"):
+            if buildfile_path is not None:
+                raise BuildError("a Buildfile path may only be provided once")
+            index += 1
+            if index >= len(arguments):
+                raise BuildError("%s requires a path" % argument)
+            buildfile_path = arguments[index]
+        elif argument.startswith("--file="):
+            if buildfile_path is not None:
+                raise BuildError("a Buildfile path may only be provided once")
+            buildfile_path = argument.split("=", 1)[1]
+            if not buildfile_path:
+                raise BuildError("--file requires a path")
+        elif argument.startswith("-"):
+            raise BuildError("unknown option '%s'" % argument)
+        else:
+            targets.append(argument)
+        index += 1
+    if list_only and targets:
+        raise BuildError("--list does not accept targets")
+    return show_help, list_only, verbose, buildfile_path, targets
+
+
+def main(arguments=None, stdout=None, stderr=None):
+    arguments = sys.argv[1:] if arguments is None else arguments
+    stdout = sys.stdout if stdout is None else stdout
+    stderr = sys.stderr if stderr is None else stderr
+
+    try:
+        show_help, list_only, verbose, buildfile_path, targets = parse_arguments(arguments)
+        if show_help:
+            print(USAGE.rstrip(), file=stdout)
+            return 0
+
+        if buildfile_path is None:
+            selected_path = discover_buildfile()
+        else:
+            selected_path = os.path.abspath(buildfile_path)
+            if not os.path.isfile(selected_path):
+                raise BuildError("Buildfile '%s' not found" % buildfile_path)
+
+        original_directory = os.getcwd()
+        build_directory = os.path.dirname(selected_path)
+        try:
+            os.chdir(build_directory)
+            buildfile = Buildfile(os.path.basename(selected_path)).parse()
+            system = BuildSystem(buildfile, stdout, stderr, verbose=verbose)
+            if list_only:
+                system.list_targets()
+                return 0
+
+            if not targets:
+                if buildfile.first_target is None:
+                    raise BuildError("Buildfile contains no targets")
+                targets = [buildfile.first_target]
+            system.build(targets)
+            return 0
+        finally:
+            os.chdir(original_directory)
+    except BuildError as error:
+        print("makeover: error: %s" % error, file=stderr)
+        return 1
+    except KeyboardInterrupt:
+        print("makeover: interrupted", file=stderr)
+        return 130
+
+
+if __name__ == "__main__":
+    sys.exit(main())

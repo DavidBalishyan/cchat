@@ -1,14 +1,18 @@
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <unistd.h>
-#include <arpa/inet.h>
-#include <sys/socket.h>
-#include <sys/types.h>
-#include <netinet/in.h>
-#include <sys/time.h>
+#ifndef C_CHAT_SERVER_LOADER_H
+#define C_CHAT_SERVER_LOADER_H
 
-#define PORT 8080
+#include <stddef.h>
+
+#define DEFAULT_PORT 8080
 #define MAX_CLIENTS 10
-#define BUFFER_SIZE 1024
+#define LISTEN_BACKLOG MAX_CLIENTS
+#define READ_BUFFER_SIZE 4096
+#define MAX_PENDING_BYTES (64U * 1024U)
+#define MAX_MESSAGE_LENGTH 4096
+#define MAX_USERNAME_LENGTH 24
+#define MAX_PASSWORD_LENGTH 128
+#define AUTHENTICATION_TIMEOUT_SECONDS 15
+#define POLL_INTERVAL_MILLISECONDS 1000
+#define PROTOCOL_VERSION "CCHAT/1"
 
+#endif
